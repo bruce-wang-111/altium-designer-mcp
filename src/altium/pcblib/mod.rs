@@ -290,6 +290,9 @@ impl PcbLib {
         // Read FileHeader for library metadata (validates file type)
         library.metadata = Self::read_file_header(&mut cfb)?;
 
+        // Read Library/Data for component ordering (preferred over FileHeader)
+        Self::read_library_data(&mut cfb, &mut library.metadata);
+
         // Read Storage stream for UniqueIdPrimitiveInformation (if present)
         // Note: This is currently a stub - the format is not fully documented
         Self::read_storage_stream(&mut cfb);
@@ -422,11 +425,15 @@ impl PcbLib {
 
     /// Reads the `FileHeader` stream and parses library metadata.
     ///
-    /// The `FileHeader` contains pipe-delimited key=value pairs:
-    /// - `HEADER`: File type identifier
-    /// - `CompCount`: Number of components
-    /// - `LibRef{N}`: Component names (0-indexed)
-    /// - `CompDescr{N}`: Component descriptions
+    /// The `FileHeader` can be in two formats:
+    ///
+    /// 1. **Binary version string** (Altium/AltiumSharp format):
+    ///    `[string_len:4 LE][string_len:1]["PCB 6.0 Binary Library File"]`
+    ///
+    /// 2. **Pipe-delimited key=value** (legacy format):
+    ///    `|HEADER=Protel for Windows - PCB Library|COMPCOUNT=...|LIBREF0=...|`
+    ///
+    /// Component metadata is obtained from `/Library/Data` when available.
     ///
     /// # Errors
     ///
@@ -450,12 +457,31 @@ impl PcbLib {
             return Ok(metadata);
         }
 
-        // FileHeader is ASCII text with pipe-delimited key=value pairs
+        // Try binary version string format first:
+        // [string_len:4 LE u32][string_len:1 u8][string_data]
+        if data.len() >= 5 {
+            let block_len = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
+            let str_len = data[4] as usize;
+
+            if block_len == str_len && data.len() >= 5 + str_len {
+                if let Ok(version) = std::str::from_utf8(&data[5..5 + str_len]) {
+                    if version.contains("PCB") && version.contains("Binary Library File") {
+                        metadata.header = version.to_string();
+                        tracing::debug!(
+                            header = %metadata.header,
+                            "Parsed FileHeader (binary version string)"
+                        );
+                        return Ok(metadata);
+                    }
+                }
+            }
+        }
+
+        // Fall back to pipe-delimited key=value format (legacy)
         let Ok(text) = String::from_utf8(data) else {
             return Ok(metadata);
         };
 
-        // Parse key=value pairs
         for pair in text.split('|') {
             if let Some((key, value)) = pair.split_once('=') {
                 let key_upper = key.to_uppercase();
@@ -467,10 +493,8 @@ impl PcbLib {
                         metadata.component_count = value.parse().unwrap_or(0);
                     }
                     _ => {
-                        // Check for LibRef{N} and CompDescr{N} patterns
                         if let Some(idx_str) = key_upper.strip_prefix("LIBREF") {
                             if let Ok(idx) = idx_str.parse::<usize>() {
-                                // Ensure vector is large enough
                                 while metadata.component_names.len() <= idx {
                                     metadata.component_names.push(String::new());
                                 }
@@ -478,7 +502,6 @@ impl PcbLib {
                             }
                         } else if let Some(idx_str) = key_upper.strip_prefix("COMPDESCR") {
                             if let Ok(idx) = idx_str.parse::<usize>() {
-                                // Ensure vector is large enough
                                 while metadata.component_descriptions.len() <= idx {
                                     metadata.component_descriptions.push(String::new());
                                 }
@@ -491,8 +514,10 @@ impl PcbLib {
         }
 
         // Validate file type - must be a PCB library
-        if !metadata.header.is_empty() && !metadata.header.contains("PCB Library") {
-            // Detect what type it actually is for a helpful error message
+        if !metadata.header.is_empty()
+            && !metadata.header.contains("PCB Library")
+            && !metadata.header.contains("PCB")
+        {
             let actual_type = if metadata.header.contains("Schematic Library") {
                 "SchLib (Schematic Library)"
             } else {
@@ -505,10 +530,96 @@ impl PcbLib {
             header = %metadata.header,
             count = metadata.component_count,
             names = metadata.component_names.len(),
-            "Parsed FileHeader"
+            "Parsed FileHeader (pipe-delimited)"
         );
 
         Ok(metadata)
+    }
+
+    /// Reads the `/Library/Data` stream for component ordering metadata.
+    ///
+    /// # Format
+    ///
+    /// ```text
+    /// [block_len:4]["|KEY=VAL|..." + \x00]   // parameter block
+    /// [component_count:4 LE u32]
+    /// [block_len:4][str_len:1][name]          // per component (WriteStringBlock)
+    /// ```
+    fn read_library_data<F: std::io::Read + std::io::Seek>(
+        cfb: &mut cfb::CompoundFile<F>,
+        metadata: &mut LibraryMetadata,
+    ) {
+        let data_path = std::path::Path::new("/Library/Data");
+        if !cfb.is_stream(data_path) {
+            return;
+        }
+
+        let Ok(mut stream) = cfb.open_stream(data_path) else {
+            return;
+        };
+
+        let mut data = Vec::new();
+        if std::io::Read::read_to_end(&mut stream, &mut data).is_err() {
+            return;
+        }
+
+        if data.len() < 8 {
+            return;
+        }
+
+        // Skip parameter block: [block_len:4][content]
+        let block_len = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
+        let mut offset = 4 + block_len;
+
+        if offset + 4 > data.len() {
+            return;
+        }
+
+        // Read component count
+        let comp_count = u32::from_le_bytes([
+            data[offset],
+            data[offset + 1],
+            data[offset + 2],
+            data[offset + 3],
+        ]) as usize;
+        offset += 4;
+
+        metadata.component_count = comp_count;
+        metadata.component_names.clear();
+
+        // Read component names: [block_len:4][str_len:1][name]
+        for _ in 0..comp_count {
+            if offset + 4 > data.len() {
+                break;
+            }
+
+            let name_block_len = u32::from_le_bytes([
+                data[offset],
+                data[offset + 1],
+                data[offset + 2],
+                data[offset + 3],
+            ]) as usize;
+            offset += 4;
+
+            if name_block_len == 0 || offset + name_block_len > data.len() {
+                break;
+            }
+
+            let str_len = data[offset] as usize;
+            if str_len < name_block_len && offset + 1 + str_len <= data.len() {
+                if let Ok(name) = std::str::from_utf8(&data[offset + 1..offset + 1 + str_len]) {
+                    metadata.component_names.push(name.to_string());
+                }
+            }
+
+            offset += name_block_len;
+        }
+
+        tracing::debug!(
+            count = metadata.component_count,
+            names = metadata.component_names.len(),
+            "Parsed Library/Data"
+        );
     }
 
     /// Reads the `/Storage` stream for `UniqueIdPrimitiveInformation` mappings.
@@ -807,24 +918,25 @@ impl PcbLib {
         writer: impl std::io::Read + std::io::Write + std::io::Seek,
         path: &std::path::Path,
     ) -> AltiumResult<()> {
-        use cfb::CompoundFile;
+        use cfb::{CompoundFile, Version};
 
         // Convert model_3d references to ComponentBody + EmbeddedModel before writing
         self.prepare_3d_models_for_writing()?;
 
-        let mut cfb = CompoundFile::create(writer)
+        // Use OLE v3 (512-byte sectors) - Altium Designer requires this format
+        let mut cfb = CompoundFile::create_with_version(Version::V3, writer)
             .map_err(|e| AltiumError::invalid_ole(format!("Failed to create OLE file: {e}")))?;
 
         // Generate OLE-safe names for all footprints (handles long names and collisions)
         let ole_names = self.generate_ole_names();
 
-        // Write FileHeader with OLE names
+        // Write FileHeader (pipe-delimited format for reader compatibility)
         self.write_file_header(&mut cfb, &ole_names)?;
 
-        // Write WideStrings stream if there's text content
-        self.write_wide_strings(&mut cfb)?;
+        // Write Library storage (Header + Data for Altium compatibility)
+        self.write_library(&mut cfb, &ole_names)?;
 
-        // Write embedded 3D models if present
+        // Write embedded 3D models if present (under /Library/Models/)
         self.write_models(&mut cfb)?;
 
         // Write each footprint using its OLE-safe name
@@ -979,32 +1091,6 @@ impl PcbLib {
         ole_names
     }
 
-    /// Writes the `WideStrings` stream if there's text content to store.
-    fn write_wide_strings<F: std::io::Read + std::io::Write + std::io::Seek>(
-        &self,
-        cfb: &mut cfb::CompoundFile<F>,
-    ) -> AltiumResult<()> {
-        // Collect text content from all footprints
-        let texts = writer::collect_wide_strings_content(&self.footprints);
-
-        if texts.is_empty() {
-            return Ok(());
-        }
-
-        // Convert to references for encoding
-        let text_refs: Vec<&str> = texts.iter().map(String::as_str).collect();
-        let data = writer::encode_wide_strings(&text_refs);
-
-        let mut stream = cfb
-            .create_stream("/WideStrings")
-            .map_err(|e| AltiumError::invalid_ole(format!("Failed to create WideStrings: {e}")))?;
-        std::io::Write::write_all(&mut stream, &data)
-            .map_err(|e| AltiumError::invalid_ole(format!("Failed to write WideStrings: {e}")))?;
-
-        tracing::debug!(count = texts.len(), "Wrote WideStrings stream");
-        Ok(())
-    }
-
     /// Writes embedded 3D models to `/Library/Models/` storage.
     ///
     /// Creates:
@@ -1063,50 +1149,121 @@ impl PcbLib {
         Ok(())
     }
 
-    /// Writes the `FileHeader` stream.
+    /// Writes the `/FileHeader` stream.
     ///
-    /// The `FileHeader` contains library metadata as pipe-delimited key=value pairs:
-    /// - `HEADER`: File type identifier
-    /// - `WEIGHT`: Number of components (same as `CompCount`)
-    /// - `CompCount`: Number of components
-    /// - `LibRef{N}`: OLE storage names (used for lookup)
-    /// - `CompDescr{N}`: Component descriptions
+    /// The `FileHeader` contains a binary-encoded version string:
+    /// ```text
+    /// [string_length:4 LE u32][string_length:1 u8]["PCB 6.0 Binary Library File"]
+    /// ```
+    ///
+    /// The 4-byte and 1-byte lengths are the same value (27).
+    /// Component metadata is stored in `/Library/Data`, not here.
+    #[allow(clippy::unused_self)]
     fn write_file_header<F: std::io::Read + std::io::Write + std::io::Seek>(
+        &self,
+        cfb: &mut cfb::CompoundFile<F>,
+        _ole_names: &[String],
+    ) -> AltiumResult<()> {
+        let version_string = b"PCB 6.0 Binary Library File";
+        #[allow(clippy::cast_possible_truncation)]
+        let len = version_string.len() as u32;
+
+        let mut data = Vec::with_capacity(4 + 1 + version_string.len());
+        data.extend_from_slice(&len.to_le_bytes()); // 4-byte length
+        #[allow(clippy::cast_possible_truncation)]
+        data.push(len as u8); // 1-byte length (same value)
+        data.extend_from_slice(version_string); // raw string
+
+        let mut stream = cfb
+            .create_stream("/FileHeader")
+            .map_err(|e| AltiumError::invalid_ole(format!("Failed to create FileHeader: {e}")))?;
+        std::io::Write::write_all(&mut stream, &data)
+            .map_err(|e| AltiumError::invalid_ole(format!("Failed to write FileHeader: {e}")))?;
+
+        Ok(())
+    }
+
+    /// Writes the `/Library` storage with Header and Data streams.
+    ///
+    /// # Streams Created
+    ///
+    /// - `/Library/Header` - 4-byte record count (always 1)
+    /// - `/Library/Data` - Library parameters + component count + component names
+    ///
+    /// # Format
+    ///
+    /// Library/Data:
+    /// ```text
+    /// [block_len:4]["|KEY=VAL|..." + \x00]   // parameter block (null-terminated)
+    /// [component_count:4 LE u32]
+    /// [block_len:4][str_len:1][name]          // per component (WriteStringBlock)
+    /// ```
+    fn write_library<F: std::io::Read + std::io::Write + std::io::Seek>(
         &self,
         cfb: &mut cfb::CompoundFile<F>,
         ole_names: &[String],
     ) -> AltiumResult<()> {
         use std::fmt::Write;
 
-        let mut header = String::new();
+        // Create /Library storage
+        cfb.create_storage("/Library").map_err(|e| {
+            AltiumError::invalid_ole(format!("Failed to create Library storage: {e}"))
+        })?;
 
-        // File type identifier
-        header.push_str("|HEADER=Protel for Windows - PCB Library");
+        // Write Library/Header (record count = 1)
+        let mut header_stream = cfb.create_stream("/Library/Header").map_err(|e| {
+            AltiumError::invalid_ole(format!("Failed to create Library/Header: {e}"))
+        })?;
+        std::io::Write::write_all(&mut header_stream, &1u32.to_le_bytes()).map_err(|e| {
+            AltiumError::invalid_ole(format!("Failed to write Library/Header: {e}"))
+        })?;
 
-        // Component count (WEIGHT is legacy name, CompCount is modern)
-        let count = self.footprints.len();
-        let _ = write!(header, "|WEIGHT={count}");
-        let _ = write!(header, "|COMPCOUNT={count}");
+        // Build Library/Data content
+        let mut params = String::new();
 
-        // Component names and descriptions
-        for (idx, (footprint, ole_name)) in self.footprints.iter().zip(ole_names.iter()).enumerate()
-        {
-            // LibRef uses the OLE-safe name (for storage path lookup)
-            let _ = write!(header, "|LIBREF{idx}={ole_name}");
+        // Library parameters (minimal required set, leading pipe)
+        params.push_str("|KIND=Protel_Advanced_PCB_Library");
+        params.push_str("|VERSION=3.00");
 
-            // CompDescr uses the footprint description
-            if !footprint.description.is_empty() {
-                let _ = write!(header, "|COMPDESCR{idx}={}", footprint.description);
+        // Add current date/time
+        let now = chrono::Local::now();
+        let _ = write!(params, "|DATE={}", now.format("%d. %m. %Y"));
+        let _ = write!(params, "|TIME={}", now.format("%H:%M:%S"));
+
+        params.push('|');
+
+        // Encode parameters block: [block_len:4][params + \x00]
+        // Block length includes the null terminator
+        let params_bytes = params.as_bytes();
+        let mut data = Vec::new();
+
+        #[allow(clippy::cast_possible_truncation)]
+        let block_len = (params_bytes.len() + 1) as u32; // +1 for null terminator
+        data.extend_from_slice(&block_len.to_le_bytes());
+        data.extend_from_slice(params_bytes);
+        data.push(0x00); // Null terminator
+
+        // Component count
+        #[allow(clippy::cast_possible_truncation)]
+        data.extend_from_slice(&(self.footprints.len() as u32).to_le_bytes());
+
+        // Component names as WriteStringBlock: [block_len:4][str_len:1][string]
+        for ole_name in ole_names {
+            let name_bytes = ole_name.as_bytes();
+            #[allow(clippy::cast_possible_truncation)]
+            {
+                data.extend_from_slice(&((name_bytes.len() + 1) as u32).to_le_bytes());
+                data.push(name_bytes.len() as u8);
             }
+            data.extend_from_slice(name_bytes);
         }
 
-        header.push('|');
-
-        let mut stream = cfb
-            .create_stream("/FileHeader")
-            .map_err(|e| AltiumError::invalid_ole(format!("Failed to create FileHeader: {e}")))?;
-        std::io::Write::write_all(&mut stream, header.as_bytes())
-            .map_err(|e| AltiumError::invalid_ole(format!("Failed to write FileHeader: {e}")))?;
+        // Write Library/Data
+        let mut data_stream = cfb
+            .create_stream("/Library/Data")
+            .map_err(|e| AltiumError::invalid_ole(format!("Failed to create Library/Data: {e}")))?;
+        std::io::Write::write_all(&mut data_stream, &data)
+            .map_err(|e| AltiumError::invalid_ole(format!("Failed to write Library/Data: {e}")))?;
 
         Ok(())
     }
@@ -1118,6 +1275,17 @@ impl PcbLib {
     /// * `cfb` - The OLE compound file
     /// * `footprint` - The footprint to write
     /// * `ole_name` - The OLE-safe storage name (≤31 chars, unique)
+    ///
+    /// # Streams Created
+    ///
+    /// - `/{ole_name}/Header` - 4-byte primitive count
+    /// - `/{ole_name}/Parameters` - Footprint metadata
+    /// - `/{ole_name}/Data` - Binary primitive data
+    /// - `/{ole_name}/WideStrings` - Encoded text content
+    /// - `/{ole_name}/PrimitiveGuids/Header` - GUID record count
+    /// - `/{ole_name}/PrimitiveGuids/Data` - GUIDs for each primitive
+    /// - `/{ole_name}/UniqueIDPrimitiveInformation/Header` - UID record count (if applicable)
+    /// - `/{ole_name}/UniqueIDPrimitiveInformation/Data` - UID data (if applicable)
     #[allow(clippy::unused_self)] // Method for consistency with other write methods
     fn write_footprint<F: std::io::Read + std::io::Write + std::io::Seek>(
         &self,
@@ -1131,16 +1299,33 @@ impl PcbLib {
         cfb.create_storage(&storage_path)
             .map_err(|e| AltiumError::invalid_ole(format!("Failed to create storage: {e}")))?;
 
-        // Write Parameters stream
+        // Write Header stream (4-byte primitive count)
+        let header_path = format!("{storage_path}/Header");
+        let header_data = writer::encode_component_header(footprint);
+        let mut stream = cfb
+            .create_stream(&header_path)
+            .map_err(|e| AltiumError::invalid_ole(format!("Failed to create Header: {e}")))?;
+        std::io::Write::write_all(&mut stream, &header_data)
+            .map_err(|e| AltiumError::invalid_ole(format!("Failed to write Header: {e}")))?;
+
+        // Write Parameters stream: [block_len:4]["|PATTERN=...|" + \x00]
         let params = format!(
             "|PATTERN={}|DESCRIPTION={}|",
             footprint.name, footprint.description
         );
+        let params_bytes = params.as_bytes();
+        #[allow(clippy::cast_possible_truncation)]
+        let params_block_len = (params_bytes.len() + 1) as u32; // +1 for null terminator
+        let mut params_data = Vec::with_capacity(4 + params_bytes.len() + 1);
+        params_data.extend_from_slice(&params_block_len.to_le_bytes());
+        params_data.extend_from_slice(params_bytes);
+        params_data.push(0x00); // Null terminator
+
         let params_path = format!("{storage_path}/Parameters");
         let mut stream = cfb
             .create_stream(&params_path)
             .map_err(|e| AltiumError::invalid_ole(format!("Failed to create Parameters: {e}")))?;
-        std::io::Write::write_all(&mut stream, params.as_bytes())
+        std::io::Write::write_all(&mut stream, &params_data)
             .map_err(|e| AltiumError::invalid_ole(format!("Failed to write Parameters: {e}")))?;
 
         // Write Data stream with primitives
@@ -1153,7 +1338,42 @@ impl PcbLib {
         std::io::Write::write_all(&mut stream, &data)
             .map_err(|e| AltiumError::invalid_ole(format!("Failed to write Data: {e}")))?;
 
-        // Write UniqueIDPrimitiveInformation stream if any primitives have unique IDs
+        // Write WideStrings stream (per-component)
+        let wide_strings_path = format!("{storage_path}/WideStrings");
+        let wide_strings_data = writer::encode_component_wide_strings(footprint);
+        let mut stream = cfb
+            .create_stream(&wide_strings_path)
+            .map_err(|e| AltiumError::invalid_ole(format!("Failed to create WideStrings: {e}")))?;
+        std::io::Write::write_all(&mut stream, &wide_strings_data)
+            .map_err(|e| AltiumError::invalid_ole(format!("Failed to write WideStrings: {e}")))?;
+
+        // Write PrimitiveGuids streams
+        let guids_storage_path = format!("{storage_path}/PrimitiveGuids");
+        cfb.create_storage(&guids_storage_path).map_err(|e| {
+            AltiumError::invalid_ole(format!("Failed to create PrimitiveGuids storage: {e}"))
+        })?;
+
+        // PrimitiveGuids/Header
+        let guids_header_path = format!("{guids_storage_path}/Header");
+        let guids_header_data = writer::encode_primitive_guids_header(footprint);
+        let mut stream = cfb.create_stream(&guids_header_path).map_err(|e| {
+            AltiumError::invalid_ole(format!("Failed to create PrimitiveGuids/Header: {e}"))
+        })?;
+        std::io::Write::write_all(&mut stream, &guids_header_data).map_err(|e| {
+            AltiumError::invalid_ole(format!("Failed to write PrimitiveGuids/Header: {e}"))
+        })?;
+
+        // PrimitiveGuids/Data
+        let guids_data_path = format!("{guids_storage_path}/Data");
+        let guids_data = writer::encode_primitive_guids_data(footprint);
+        let mut stream = cfb.create_stream(&guids_data_path).map_err(|e| {
+            AltiumError::invalid_ole(format!("Failed to create PrimitiveGuids/Data: {e}"))
+        })?;
+        std::io::Write::write_all(&mut stream, &guids_data).map_err(|e| {
+            AltiumError::invalid_ole(format!("Failed to write PrimitiveGuids/Data: {e}"))
+        })?;
+
+        // Write UniqueIDPrimitiveInformation streams if any primitives have unique IDs
         if let Some(uid_data) = writer::encode_unique_id_stream(footprint) {
             // Create UniqueIDPrimitiveInformation storage
             let uid_storage_path = format!("{storage_path}/UniqueIDPrimitiveInformation");
@@ -1163,7 +1383,21 @@ impl PcbLib {
                 ))
             })?;
 
-            // Write Data stream inside UniqueIDPrimitiveInformation
+            // Write Header stream
+            let uid_header_path = format!("{uid_storage_path}/Header");
+            let uid_header_data = writer::encode_unique_id_header(footprint);
+            let mut uid_header_stream = cfb.create_stream(&uid_header_path).map_err(|e| {
+                AltiumError::invalid_ole(format!(
+                    "Failed to create UniqueIDPrimitiveInformation/Header: {e}"
+                ))
+            })?;
+            std::io::Write::write_all(&mut uid_header_stream, &uid_header_data).map_err(|e| {
+                AltiumError::invalid_ole(format!(
+                    "Failed to write UniqueIDPrimitiveInformation/Header: {e}"
+                ))
+            })?;
+
+            // Write Data stream
             let uid_data_path = format!("{uid_storage_path}/Data");
             let mut uid_stream = cfb.create_stream(&uid_data_path).map_err(|e| {
                 AltiumError::invalid_ole(format!(
@@ -1179,7 +1413,7 @@ impl PcbLib {
             tracing::trace!(
                 footprint = %footprint.name,
                 size = uid_data.len(),
-                "Wrote UniqueIDPrimitiveInformation stream"
+                "Wrote UniqueIDPrimitiveInformation streams"
             );
         }
 
@@ -2221,7 +2455,7 @@ mod tests {
 
         // Should only have 1 entry (the pad with the unique ID)
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].primitive_index, 1);
+        assert_eq!(entries[0].primitive_index, 0); // 0-based index
         assert_eq!(entries[0].unique_id, "ONLYTHIS");
     }
 

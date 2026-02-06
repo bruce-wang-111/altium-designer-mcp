@@ -187,8 +187,13 @@ pub fn parse_unique_id_stream(data: &[u8]) -> UniqueIdMap {
         let record_data = &data[offset..offset + record_len];
         offset += record_len;
 
-        // Parse the pipe-delimited record
-        if let Ok(record_str) = String::from_utf8(record_data.to_vec()) {
+        // Parse the pipe-delimited record (strip trailing null terminators)
+        let trimmed = record_data
+            .iter()
+            .copied()
+            .take_while(|&b| b != 0x00)
+            .collect::<Vec<u8>>();
+        if let Ok(record_str) = String::from_utf8(trimmed) {
             if let Some(entry) = parse_unique_id_record(&record_str) {
                 tracing::trace!(
                     index = entry.primitive_index,
@@ -272,61 +277,63 @@ pub fn apply_unique_ids(footprint: &mut Footprint, unique_ids: &UniqueIdMap) {
         );
     }
 
-    // The PRIMITIVEINDEX appears to be 1-indexed and sequential within each primitive type
-    // Apply unique IDs to each primitive type
+    // Detect indexing mode: if any entry has index 0, use 0-based;
+    // otherwise assume 1-based (for backward compatibility with older Altium files).
+    let has_zero_index = unique_ids.iter().any(|e| e.primitive_index == 0);
+    let offset: usize = usize::from(!has_zero_index);
 
     // Pads
     for (i, pad) in footprint.pads.iter_mut().enumerate() {
-        if let Some(&uid) = lookup.get(&("Pad", i + 1)) {
+        if let Some(&uid) = lookup.get(&("Pad", i + offset)) {
             pad.unique_id = Some(uid.to_string());
         }
     }
 
     // Vias
     for (i, via) in footprint.vias.iter_mut().enumerate() {
-        if let Some(&uid) = lookup.get(&("Via", i + 1)) {
+        if let Some(&uid) = lookup.get(&("Via", i + offset)) {
             via.unique_id = Some(uid.to_string());
         }
     }
 
     // Tracks
     for (i, track) in footprint.tracks.iter_mut().enumerate() {
-        if let Some(&uid) = lookup.get(&("Track", i + 1)) {
+        if let Some(&uid) = lookup.get(&("Track", i + offset)) {
             track.unique_id = Some(uid.to_string());
         }
     }
 
     // Arcs
     for (i, arc) in footprint.arcs.iter_mut().enumerate() {
-        if let Some(&uid) = lookup.get(&("Arc", i + 1)) {
+        if let Some(&uid) = lookup.get(&("Arc", i + offset)) {
             arc.unique_id = Some(uid.to_string());
         }
     }
 
     // Regions
     for (i, region) in footprint.regions.iter_mut().enumerate() {
-        if let Some(&uid) = lookup.get(&("Region", i + 1)) {
+        if let Some(&uid) = lookup.get(&("Region", i + offset)) {
             region.unique_id = Some(uid.to_string());
         }
     }
 
     // Text
     for (i, text) in footprint.text.iter_mut().enumerate() {
-        if let Some(&uid) = lookup.get(&("Text", i + 1)) {
+        if let Some(&uid) = lookup.get(&("Text", i + offset)) {
             text.unique_id = Some(uid.to_string());
         }
     }
 
     // Fills
     for (i, fill) in footprint.fills.iter_mut().enumerate() {
-        if let Some(&uid) = lookup.get(&("Fill", i + 1)) {
+        if let Some(&uid) = lookup.get(&("Fill", i + offset)) {
             fill.unique_id = Some(uid.to_string());
         }
     }
 
     // ComponentBodies
     for (i, body) in footprint.component_bodies.iter_mut().enumerate() {
-        if let Some(&uid) = lookup.get(&("ComponentBody", i + 1)) {
+        if let Some(&uid) = lookup.get(&("ComponentBody", i + offset)) {
             body.unique_id = Some(uid.to_string());
         }
     }

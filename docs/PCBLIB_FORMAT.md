@@ -7,69 +7,122 @@ This document describes the binary format of Altium Designer `.PcbLib` (PCB foot
 
 ## File Structure
 
-PcbLib files are OLE Compound Documents (CFB format) containing:
+PcbLib files are OLE Compound Documents (CFB format, **OLE v3 with 512-byte sectors**) containing:
 
 ```text
 /
-├── FileHeader          # Library metadata
-├── Storage             # Additional storage info (contains UniqueIdPrimitiveInformation mappings)
-├── WideStrings         # UTF-16 encoded text content
-└── {ComponentName}/    # One storage per footprint
-    └── Data            # Binary primitives stream
+├── FileHeader                          # Binary version string
+├── Library/
+│   ├── Header                          # u32: record count (always 1)
+│   ├── Data                            # Params block + component count + names
+│   └── Models/
+│       ├── Header                      # u32: embedded model count
+│       ├── Data                        # Model parameter records
+│       ├── 0                           # First embedded model (zlib-compressed STEP)
+│       ├── 1                           # Second embedded model
+│       └── ...
+└── {ComponentName}/                    # One storage per footprint
+    ├── Header                          # u32: exact primitive count
+    ├── Parameters                      # Block-prefixed pipe-delimited params
+    ├── Data                            # Name block + primitives + end marker
+    ├── WideStrings                     # Block-prefixed ENCODEDTEXT params
+    └── UniqueIdPrimitiveInformation/
+        ├── Header                      # u32: record count
+        └── Data                        # Block-prefixed UID records
 ```
 
-## FileHeader Stream
+> **Note:** OLE version MUST be V3 (512-byte sectors). Altium Designer rejects V4 (4096-byte) files.
 
-The FileHeader contains library-level metadata as pipe-delimited key=value pairs:
+## Encoding Primitives (Building Blocks)
+
+All Altium streams use these common encoding patterns:
+
+| Pattern | Format |
+|---------|--------|
+| `WriteBlock(data)` | `[block_len:4 LE][data]` |
+| `WriteStringBlock(str)` | `[block_len:4][str_len:1][raw_string]` |
+| `WriteParameters(params)` | `WriteCString(pipe-params)` = `"\|KEY=VAL\|..." + \x00` |
+| `WriteBlock(WriteParameters)` | `[block_len:4]["\|KEY=VAL\|..." + \x00]` |
+
+**Critical rules:**
+
+- Parameters ALWAYS start with a leading `|` pipe character
+- Parameters ALWAYS end with `\x00` null terminator
+- Block lengths INCLUDE the null terminator
+- All strings use Windows-1252 encoding, NOT UTF-8
+
+## `FileHeader` Stream
+
+The `FileHeader` contains a binary-encoded version string (**NOT** pipe-delimited key=value pairs):
 
 ```text
-[length:4 LE][text...]
+[string_length:4 LE u32]   = 27
+[string_length:1 byte]     = 27
+[string_data:27 bytes]     = "PCB 6.0 Binary Library File"
 ```
 
-Key fields:
+The 4-byte and 1-byte lengths are the SAME value (redundant). Total: 32 bytes.
 
-| Key | Description |
-|-----|-------------|
-| `HEADER` | File type identifier |
-| `CompCount` | Number of components |
-| `LibRef{N}` | Component name (0-indexed) |
-| `CompDescr{N}` | Component description |
+> **Note:** Component metadata (names, descriptions) is stored in `/Library/Data`, not in `FileHeader`.
 
-## Storage Stream
+## `/Library/Data` Stream
 
-The Storage stream contains additional metadata including unique ID mappings for primitives.
+Contains library-level parameters and the component directory:
 
 ```text
-[length:4 LE][pipe-delimited key=value pairs...]
+[block_len:4]["|KIND=Protel_Advanced_PCB_Library|VERSION=3.00|..." + \x00]
+[component_count:4 LE u32]
+// For each component:
+[block_len:4][str_len:1][component_name]   // WriteStringBlock
 ```
 
-Key fields:
+The parameter block uses the standard `WriteBlock(WriteParameters)` encoding.
 
-| Key | Description |
-|-----|-------------|
-| `HEADER` | Stream type identifier |
-| `WEIGHT` | File weight/version |
-| `MINORVERSION` | Minor version number |
-| `UNIQUEID` | Library unique ID (8-char alphanumeric) |
+## Per-Component Streams
 
-### UniqueIdPrimitiveInformation
-
-Primitive unique IDs are stored as indexed entries within the Storage stream:
+### `/{component}/Header`
 
 ```text
-|PRIMITIVEINDEX={index}|PRIMITIVEOBJECTID={type}|UNIQUEID={uid}|
+[primitive_count:4 LE u32]
+```
+
+This is the **exact** primitive count. NOT count + 1.
+
+### `/{component}/Parameters`
+
+```text
+[block_len:4]["|PATTERN=MyComponent|DESCRIPTION=My Desc|" + \x00]
+```
+
+Standard `WriteBlock(WriteParameters)` encoding — block-prefixed, pipe-delimited, null-terminated.
+
+### `/{component}/WideStrings`
+
+```text
+[block_len:4]["|ENCODEDTEXT0=72,101,108,108,111|..." + \x00]
+```
+
+When empty (no text content): `[block_len:4]["|" + \x00]` (`block_len` = 2).
+
+### `/{component}/UniqueIdPrimitiveInformation`
+
+**Header:** `[record_count:4 LE u32]`
+
+**Data:** Block-prefixed records, one per primitive:
+
+```text
+[block_len:4]["|PRIMITIVEINDEX=0|PRIMITIVEOBJECTID=Pad|UNIQUEID=ABCD1234" + \x00]
 ```
 
 | Field | Description |
 |-------|-------------|
-| `PRIMITIVEINDEX` | 1-based index within primitive type |
+| `PRIMITIVEINDEX` | 0-based index within primitive type |
 | `PRIMITIVEOBJECTID` | Primitive type name (Pad, Via, Track, Arc, Region, Text, Fill, ComponentBody) |
 | `UNIQUEID` | 8-character alphanumeric identifier |
 
-> **Note:** All primitives support a `unique_id` field for tracking across edits. The tool preserves existing
-> unique IDs when reading and generates new ones when creating primitives.
->
-> `PRIMITIVEINDEX` is 1-based, not 0-based. Lookup is by (type, index) tuple.
+> **Note:** `PRIMITIVEINDEX` is 0-based (matching AltiumSharp convention). The reader auto-detects
+> 0-based vs 1-based indexing for backward compatibility with older Altium files.
+> Lookup is by (type, index) tuple.
 
 ## Data Stream Format
 
@@ -627,13 +680,15 @@ A single 4-byte little-endian unsigned integer containing the number of embedded
 
 **Data stream format:**
 
-A sequence of length-prefixed records, one per embedded model:
+A sequence of block-prefixed records using standard `WriteBlock(WriteParameters)` encoding:
 
 ```text
-[record_len:4 LE][pipe-delimited params][null:1]
-[record_len:4 LE][pipe-delimited params][null:1]
+[block_len:4 LE]["|EMBED=TRUE|MODELSOURCE=Undefined|ID={GUID}|..." + \x00]
+[block_len:4 LE]["|EMBED=TRUE|..." + \x00]
 ...
 ```
+
+Block length includes the null terminator. Parameters start with a leading `|`.
 
 Each record contains pipe-delimited key=value pairs:
 
@@ -667,12 +722,13 @@ When writing footprint data, primitives are encoded in this specific order:
 
 ## Notes
 
-- **WideStrings stream**: Format documented above, inline `.Designator` and `.Comment` are detected
+- **OLE version**: MUST be V3 (512-byte sectors); Altium rejects V4
+- **WideStrings stream**: Per-component, block-prefixed; inline `.Designator` and `.Comment` are detected
 - **3D model embedding**: zlib-compressed STEP files, referenced by GUID
 - **Pad hole shapes**: Round (0), Square (1), Slot (2)
 - **Net information**: Used in board files, not library files
 - **Component variants**: Not applicable to library files
-- **Unique IDs**: All primitives support 8-character alphanumeric unique IDs for tracking
+- **Unique IDs**: All primitives support 8-character alphanumeric unique IDs for tracking (0-based index)
 - **Default layer mapping**: Unknown layer IDs default to Multi-Layer (74)
 - **Default hole shape**: Unknown hole shape IDs default to Round (0)
 - **Default stack mode**: Unknown stack mode IDs default to Simple (0)

@@ -19,76 +19,6 @@ use super::primitives::{
 };
 use super::Footprint;
 
-/// Encodes text content for the `WideStrings` stream.
-///
-/// # Format
-///
-/// ```text
-/// |ENCODEDTEXT0=84,69,83,84|ENCODEDTEXT1=72,69,76,76,79|
-/// ```
-///
-/// Where values are comma-separated ASCII codes.
-///
-/// # Arguments
-///
-/// * `texts` - Slice of text strings to encode
-///
-/// # Returns
-///
-/// Encoded `WideStrings` stream content as bytes.
-pub fn encode_wide_strings(texts: &[&str]) -> Vec<u8> {
-    use std::fmt::Write;
-
-    let mut output = String::new();
-
-    for (index, text) in texts.iter().enumerate() {
-        // Skip special text like .Designator and .Comment
-        if text.starts_with('.') {
-            continue;
-        }
-
-        // Encode text as comma-separated ASCII codes
-        let encoded: String = text
-            .bytes()
-            .map(|b| b.to_string())
-            .collect::<Vec<_>>()
-            .join(",");
-
-        let _ = write!(output, "|ENCODEDTEXT{index}={encoded}");
-    }
-
-    if !output.is_empty() {
-        output.push('|');
-    }
-
-    output.into_bytes()
-}
-
-/// Collects all text content from footprints that needs to be stored in `WideStrings`.
-///
-/// Returns a vector of unique text strings (excluding special values like `.Designator`).
-pub fn collect_wide_strings_content(footprints: &[Footprint]) -> Vec<String> {
-    use std::collections::HashSet;
-
-    let mut seen: HashSet<&str> = HashSet::new();
-    let mut texts = Vec::new();
-
-    for footprint in footprints {
-        for text in &footprint.text {
-            // Skip special text values and duplicates
-            if !text.text.starts_with('.')
-                && !text.text.is_empty()
-                && !seen.contains(text.text.as_str())
-            {
-                seen.insert(&text.text);
-                texts.push(text.text.clone());
-            }
-        }
-    }
-
-    texts
-}
-
 /// Conversion factor from millimetres to Altium internal units.
 /// Internal units: 10000 = 1 mil = 0.0254 mm
 const MM_TO_INTERNAL_UNITS: f64 = 10000.0 / 0.0254;
@@ -1213,20 +1143,18 @@ pub fn encode_model_data_stream(models: &[EmbeddedModel]) -> Vec<u8> {
     let mut output = Vec::new();
 
     for model in models {
-        // Build the record content
+        // Build the record content (leading pipe, pipe-delimited parameters)
         let record = format!(
-            "EMBED=TRUE|MODELSOURCE=Undefined|ID={}|ROTX=0.000|ROTY=0.000|ROTZ=0.000|DZ=0|CHECKSUM=0|NAME={}",
+            "|EMBED=TRUE|MODELSOURCE=Undefined|ID={}|ROTX=0.000|ROTY=0.000|ROTZ=0.000|DZ=0|CHECKSUM=0|NAME={}",
             model.id, model.name
         );
         let record_bytes = record.as_bytes();
 
-        // Write 4-byte little-endian length
-        output.extend_from_slice(&(record_bytes.len() as u32).to_le_bytes());
+        // Block length includes null terminator
+        output.extend_from_slice(&((record_bytes.len() + 1) as u32).to_le_bytes());
 
-        // Write record content
+        // Write record content + null terminator
         output.extend_from_slice(record_bytes);
-
-        // Write null terminator
         output.push(0x00);
     }
 
@@ -1285,12 +1213,12 @@ pub fn encode_unique_id_stream(footprint: &Footprint) -> Option<Vec<u8>> {
     let mut has_any_id = false;
 
     // Encode each primitive type with its unique IDs
-    // Index is 1-based within each type
+    // Index is 0-based (AltiumSharp convention)
 
     // Pads
     for (i, pad) in footprint.pads.iter().enumerate() {
         if let Some(ref uid) = pad.unique_id {
-            encode_unique_id_record(&mut data, i + 1, "Pad", uid);
+            encode_unique_id_record(&mut data, i, "Pad", uid);
             has_any_id = true;
         }
     }
@@ -1298,7 +1226,7 @@ pub fn encode_unique_id_stream(footprint: &Footprint) -> Option<Vec<u8>> {
     // Vias
     for (i, via) in footprint.vias.iter().enumerate() {
         if let Some(ref uid) = via.unique_id {
-            encode_unique_id_record(&mut data, i + 1, "Via", uid);
+            encode_unique_id_record(&mut data, i, "Via", uid);
             has_any_id = true;
         }
     }
@@ -1306,7 +1234,7 @@ pub fn encode_unique_id_stream(footprint: &Footprint) -> Option<Vec<u8>> {
     // Tracks
     for (i, track) in footprint.tracks.iter().enumerate() {
         if let Some(ref uid) = track.unique_id {
-            encode_unique_id_record(&mut data, i + 1, "Track", uid);
+            encode_unique_id_record(&mut data, i, "Track", uid);
             has_any_id = true;
         }
     }
@@ -1314,7 +1242,7 @@ pub fn encode_unique_id_stream(footprint: &Footprint) -> Option<Vec<u8>> {
     // Arcs
     for (i, arc) in footprint.arcs.iter().enumerate() {
         if let Some(ref uid) = arc.unique_id {
-            encode_unique_id_record(&mut data, i + 1, "Arc", uid);
+            encode_unique_id_record(&mut data, i, "Arc", uid);
             has_any_id = true;
         }
     }
@@ -1322,7 +1250,7 @@ pub fn encode_unique_id_stream(footprint: &Footprint) -> Option<Vec<u8>> {
     // Regions
     for (i, region) in footprint.regions.iter().enumerate() {
         if let Some(ref uid) = region.unique_id {
-            encode_unique_id_record(&mut data, i + 1, "Region", uid);
+            encode_unique_id_record(&mut data, i, "Region", uid);
             has_any_id = true;
         }
     }
@@ -1330,7 +1258,7 @@ pub fn encode_unique_id_stream(footprint: &Footprint) -> Option<Vec<u8>> {
     // Text
     for (i, text) in footprint.text.iter().enumerate() {
         if let Some(ref uid) = text.unique_id {
-            encode_unique_id_record(&mut data, i + 1, "Text", uid);
+            encode_unique_id_record(&mut data, i, "Text", uid);
             has_any_id = true;
         }
     }
@@ -1338,7 +1266,7 @@ pub fn encode_unique_id_stream(footprint: &Footprint) -> Option<Vec<u8>> {
     // Fills
     for (i, fill) in footprint.fills.iter().enumerate() {
         if let Some(ref uid) = fill.unique_id {
-            encode_unique_id_record(&mut data, i + 1, "Fill", uid);
+            encode_unique_id_record(&mut data, i, "Fill", uid);
             has_any_id = true;
         }
     }
@@ -1346,7 +1274,7 @@ pub fn encode_unique_id_stream(footprint: &Footprint) -> Option<Vec<u8>> {
     // ComponentBodies
     for (i, body) in footprint.component_bodies.iter().enumerate() {
         if let Some(ref uid) = body.unique_id {
-            encode_unique_id_record(&mut data, i + 1, "ComponentBody", uid);
+            encode_unique_id_record(&mut data, i, "ComponentBody", uid);
             has_any_id = true;
         }
     }
@@ -1363,8 +1291,10 @@ pub fn encode_unique_id_stream(footprint: &Footprint) -> Option<Vec<u8>> {
 /// # Format
 ///
 /// ```text
-/// [length:4 LE u32]|PRIMITIVEINDEX={index}|PRIMITIVEOBJECTID={type}|UNIQUEID={uid}
+/// [block_len:4 LE u32]["|PRIMITIVEINDEX=...|PRIMITIVEOBJECTID=...|UNIQUEID=..." + \x00]
 /// ```
+///
+/// Block length includes the null terminator.
 #[allow(clippy::cast_possible_truncation)]
 fn encode_unique_id_record(
     data: &mut Vec<u8>,
@@ -1376,11 +1306,253 @@ fn encode_unique_id_record(
         format!("|PRIMITIVEINDEX={index}|PRIMITIVEOBJECTID={primitive_type}|UNIQUEID={unique_id}");
     let record_bytes = record.as_bytes();
 
-    // Write length prefix (4 bytes LE)
-    write_u32(data, record_bytes.len() as u32);
+    // Write block length (includes null terminator)
+    write_u32(data, (record_bytes.len() + 1) as u32);
 
-    // Write record content
+    // Write record content + null terminator
     data.extend_from_slice(record_bytes);
+    data.push(0x00);
+}
+
+// =============================================================================
+// Per-Component Header Writing
+// =============================================================================
+
+/// Encodes the per-component `Header` stream.
+///
+/// # Format
+///
+/// 4-byte little-endian unsigned integer containing the exact primitive count.
+#[allow(clippy::cast_possible_truncation)]
+pub fn encode_component_header(footprint: &Footprint) -> Vec<u8> {
+    let count = footprint.arcs.len()
+        + footprint.pads.len()
+        + footprint.vias.len()
+        + footprint.tracks.len()
+        + footprint.text.len()
+        + footprint.regions.len()
+        + footprint.fills.len()
+        + footprint.component_bodies.len();
+
+    (count as u32).to_le_bytes().to_vec()
+}
+
+// =============================================================================
+// PrimitiveGuids Writing
+// =============================================================================
+
+/// Encodes the `PrimitiveGuids/Header` stream.
+///
+/// # Format
+///
+/// 4-byte little-endian unsigned integer containing the GUID record count.
+#[allow(clippy::cast_possible_truncation)]
+pub fn encode_primitive_guids_header(footprint: &Footprint) -> Vec<u8> {
+    let count = count_primitives_for_guids(footprint);
+    (count as u32).to_le_bytes().to_vec()
+}
+
+/// Encodes the `PrimitiveGuids/Data` stream.
+///
+/// # Format
+///
+/// Each record is 24 bytes:
+/// ```text
+/// [index:4 LE u32][type:4 LE u32][guid:16 bytes]
+/// ```
+///
+/// The index and type values are internal Altium identifiers.
+/// We generate sequential indices and use type values based on primitive order.
+#[allow(clippy::cast_possible_truncation)]
+pub fn encode_primitive_guids_data(footprint: &Footprint) -> Vec<u8> {
+    let count = count_primitives_for_guids(footprint);
+    let mut data = Vec::with_capacity(count * 24);
+
+    let mut record_idx: u32 = 0;
+
+    // Generate GUIDs for each primitive type
+    // Order and type values based on sample file analysis
+
+    for (i, _pad) in footprint.pads.iter().enumerate() {
+        write_guid_record(&mut data, i as u32 + 1, record_idx, generate_guid());
+        record_idx += 1;
+    }
+
+    for (i, _via) in footprint.vias.iter().enumerate() {
+        write_guid_record(&mut data, i as u32 + 1, record_idx, generate_guid());
+        record_idx += 1;
+    }
+
+    for (i, _track) in footprint.tracks.iter().enumerate() {
+        write_guid_record(&mut data, i as u32 + 1, record_idx, generate_guid());
+        record_idx += 1;
+    }
+
+    for (i, _arc) in footprint.arcs.iter().enumerate() {
+        write_guid_record(&mut data, i as u32 + 1, record_idx, generate_guid());
+        record_idx += 1;
+    }
+
+    for (i, _text) in footprint.text.iter().enumerate() {
+        write_guid_record(&mut data, i as u32 + 1, record_idx, generate_guid());
+        record_idx += 1;
+    }
+
+    for (i, _region) in footprint.regions.iter().enumerate() {
+        write_guid_record(&mut data, i as u32 + 1, record_idx, generate_guid());
+        record_idx += 1;
+    }
+
+    for (i, _fill) in footprint.fills.iter().enumerate() {
+        write_guid_record(&mut data, i as u32 + 1, record_idx, generate_guid());
+        record_idx += 1;
+    }
+
+    for (i, _body) in footprint.component_bodies.iter().enumerate() {
+        write_guid_record(&mut data, i as u32 + 1, record_idx, generate_guid());
+        record_idx += 1;
+    }
+
+    data
+}
+
+/// Counts total primitives for GUID generation.
+fn count_primitives_for_guids(footprint: &Footprint) -> usize {
+    footprint.pads.len()
+        + footprint.vias.len()
+        + footprint.tracks.len()
+        + footprint.arcs.len()
+        + footprint.text.len()
+        + footprint.regions.len()
+        + footprint.fills.len()
+        + footprint.component_bodies.len()
+}
+
+/// Writes a single GUID record (24 bytes).
+fn write_guid_record(data: &mut Vec<u8>, index: u32, ptype: u32, guid: [u8; 16]) {
+    write_u32(data, index);
+    write_u32(data, ptype);
+    data.extend_from_slice(&guid);
+}
+
+/// Generates a random GUID as 16 bytes (little-endian UUID format).
+fn generate_guid() -> [u8; 16] {
+    use uuid::Uuid;
+    *Uuid::new_v4().as_bytes()
+}
+
+// =============================================================================
+// Per-Component WideStrings Writing
+// =============================================================================
+
+/// Encodes the per-component `WideStrings` stream.
+///
+/// # Format
+///
+/// ```text
+/// [length:4 LE u32][content with null terminator]
+/// ```
+///
+/// Format: `[block_len:4]["|ENCODEDTEXT0=...|..." + \x00]`
+///
+/// Empty: `[block_len:4]["|" + \x00]` (`block_len` = 2)
+pub fn encode_component_wide_strings(footprint: &Footprint) -> Vec<u8> {
+    use std::fmt::Write;
+
+    // Collect text content from this footprint
+    let mut texts: Vec<&str> = Vec::new();
+
+    for text in &footprint.text {
+        if !text.text.starts_with('.') && !text.text.is_empty() {
+            texts.push(&text.text);
+        }
+    }
+
+    // Build encoded text parameter string (always starts with "|")
+    let mut content = String::from("|");
+    for (index, text) in texts.iter().enumerate() {
+        let encoded: String = text
+            .bytes()
+            .map(|b| b.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let _ = write!(content, "ENCODEDTEXT{index}={encoded}|");
+    }
+
+    // Block format: [block_len:4][content + \x00]
+    let content_bytes = content.as_bytes();
+    let block_len = content_bytes.len() + 1; // +1 for null terminator
+
+    let mut data = Vec::with_capacity(4 + block_len);
+    #[allow(clippy::cast_possible_truncation)]
+    write_u32(&mut data, block_len as u32);
+    data.extend_from_slice(content_bytes);
+    data.push(0x00); // Null terminator
+
+    data
+}
+
+// =============================================================================
+// UniqueIDPrimitiveInformation Header
+// =============================================================================
+
+/// Encodes the `UniqueIDPrimitiveInformation/Header` stream.
+///
+/// # Format
+///
+/// 4-byte little-endian unsigned integer containing the record count.
+#[allow(clippy::cast_possible_truncation)]
+pub fn encode_unique_id_header(footprint: &Footprint) -> Vec<u8> {
+    let count = count_unique_ids(footprint);
+    (count as u32).to_le_bytes().to_vec()
+}
+
+/// Counts primitives with unique IDs.
+fn count_unique_ids(footprint: &Footprint) -> usize {
+    let mut count = 0;
+
+    for pad in &footprint.pads {
+        if pad.unique_id.is_some() {
+            count += 1;
+        }
+    }
+    for via in &footprint.vias {
+        if via.unique_id.is_some() {
+            count += 1;
+        }
+    }
+    for track in &footprint.tracks {
+        if track.unique_id.is_some() {
+            count += 1;
+        }
+    }
+    for arc in &footprint.arcs {
+        if arc.unique_id.is_some() {
+            count += 1;
+        }
+    }
+    for text in &footprint.text {
+        if text.unique_id.is_some() {
+            count += 1;
+        }
+    }
+    for region in &footprint.regions {
+        if region.unique_id.is_some() {
+            count += 1;
+        }
+    }
+    for fill in &footprint.fills {
+        if fill.unique_id.is_some() {
+            count += 1;
+        }
+    }
+    for body in &footprint.component_bodies {
+        if body.unique_id.is_some() {
+            count += 1;
+        }
+    }
+
+    count
 }
 
 #[cfg(test)]
@@ -1518,77 +1690,6 @@ mod tests {
 
         // Should end with 0x00
         assert_eq!(*data.last().unwrap(), 0x00);
-    }
-
-    #[test]
-    fn test_encode_wide_strings() {
-        let texts = ["TEST", "HELLO"];
-        let data = encode_wide_strings(&texts);
-        let output = String::from_utf8(data).unwrap();
-
-        // Should contain ENCODEDTEXT entries with ASCII codes
-        assert!(output.contains("|ENCODEDTEXT0=84,69,83,84")); // TEST
-        assert!(output.contains("|ENCODEDTEXT1=72,69,76,76,79")); // HELLO
-    }
-
-    #[test]
-    fn test_encode_wide_strings_empty() {
-        let texts: [&str; 0] = [];
-        let data = encode_wide_strings(&texts);
-        assert!(data.is_empty());
-    }
-
-    #[test]
-    fn test_encode_wide_strings_skips_special() {
-        let texts = [".Designator", ".Comment", "ACTUAL"];
-        let data = encode_wide_strings(&texts);
-        let output = String::from_utf8(data).unwrap();
-
-        // Should only contain ACTUAL, not special text
-        assert!(!output.contains("Designator"));
-        assert!(!output.contains("Comment"));
-        // Index is 2 because .Designator (0) and .Comment (1) are skipped but preserve index
-        assert!(output.contains("|ENCODEDTEXT2=65,67,84,85,65,76")); // ACTUAL
-    }
-
-    #[test]
-    fn test_collect_wide_strings_content() {
-        use super::{Layer, PcbFlags, Text, TextKind};
-
-        let mut fp = Footprint::new("TEST");
-        fp.add_text(Text {
-            x: 0.0,
-            y: 0.0,
-            text: ".Designator".to_string(),
-            height: 1.0,
-            layer: Layer::TopOverlay,
-            rotation: 0.0,
-            kind: TextKind::Stroke,
-            stroke_font: None,
-            justification: TextJustification::MiddleCenter,
-            flags: PcbFlags::empty(),
-            unique_id: None,
-        });
-        fp.add_text(Text {
-            x: 1.0,
-            y: 0.0,
-            text: "CUSTOM_TEXT".to_string(),
-            height: 1.0,
-            layer: Layer::TopOverlay,
-            rotation: 0.0,
-            kind: TextKind::Stroke,
-            stroke_font: None,
-            justification: TextJustification::MiddleCenter,
-            flags: PcbFlags::empty(),
-            unique_id: None,
-        });
-
-        let texts = collect_wide_strings_content(&[fp]);
-
-        // Should only contain non-special text
-        assert_eq!(texts.len(), 1);
-        assert!(texts.contains(&"CUSTOM_TEXT".to_string()));
-        assert!(!texts.iter().any(|t| t.starts_with('.')));
     }
 
     // =============================================================================

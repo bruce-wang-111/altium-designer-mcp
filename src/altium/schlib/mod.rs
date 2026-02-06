@@ -48,7 +48,7 @@ pub mod primitives;
 pub mod reader;
 pub mod writer;
 
-use cfb::CompoundFile;
+use cfb::{CompoundFile, Version};
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -309,7 +309,8 @@ impl SchLib {
     ///
     /// Returns an error if the library cannot be written.
     pub fn write<W: Read + Write + Seek>(&self, writer: W) -> AltiumResult<()> {
-        let mut cfb = CompoundFile::create(writer)
+        // Use OLE v3 (512-byte sectors) - Altium Designer requires this format
+        let mut cfb = CompoundFile::create_with_version(Version::V3, writer)
             .map_err(|e| AltiumError::invalid_ole(format!("Failed to create OLE file: {e}")))?;
 
         // Collect symbols for header
